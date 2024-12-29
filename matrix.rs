@@ -23,7 +23,7 @@ fn write_reset(hex_table: &mut Vec<String>) {
 }
 
 
-fn build_fisrt_index(joined_hex_table: &String) -> HashMap<String, usize>{
+fn build_first_index(joined_hex_table: &String) -> HashMap<String, usize>{
     let mut first_index = HashMap::new();
     for i in 0..256 {
         let hex_byte = format!("{:02x}", i).to_uppercase();
@@ -36,6 +36,10 @@ fn build_fisrt_index(joined_hex_table: &String) -> HashMap<String, usize>{
 
 fn byte_to_hex(byte: &u8) -> String {
     format!("{:02X}", byte).to_uppercase()
+}
+
+fn hex_to_byte(hex: &str) -> Option<u8> {
+    u8::from_str_radix(hex, 16).ok()
 }
 
 fn seek_avail(filename: &str, first_index:HashMap<String, usize>) -> Vec<u8> {
@@ -219,14 +223,58 @@ fn main(){
 
 
     //write_reset(&mut hex_table);
-    let joined_hex_table = &hex_table.join("");
+    let joined_hex_table = &mut hex_table.join("");
     drop(hex_table);
 
-    let cryptic_data = seek_avail(&against_filename, build_fisrt_index(joined_hex_table));
+    let first_index = build_first_index(joined_hex_table);
+    
+    joined_hex_table.clear();
+
+    let cryptic_data = seek_avail(&against_filename, first_index.clone());
 
     let mut outfile = File::create("cryptic.data").unwrap();
 
     let _ = outfile.write_all(&cryptic_data);
 
+    drop(cryptic_data);
+
+    let mut cryptic_data_file = File::open("cryptic.data").unwrap();
+
+    let mut cryptic_data = Vec::new();
+
+    let _ = cryptic_data_file.read_to_end(&mut cryptic_data);
+
+    let inverted_first_index = invert_hashmap(first_index);
+
+    let rebuilt_bytes = rebuild(cryptic_data, inverted_first_index);
+
+    let mut outfile = File::create("outfile.out").unwrap();
+
+    let _ = outfile.write_all(&rebuilt_bytes);
+
+
 }
 
+fn invert_hashmap(map: HashMap<String, usize>) -> HashMap<usize, String> {
+    let mut inverted_map = HashMap::new();
+    for (key, value) in map {
+        inverted_map.insert(value, key);
+    }
+    inverted_map
+}
+
+
+fn rebuild(cryptic_data: Vec<u8>, inverted_first_index:HashMap<usize, String>) -> Vec<u8>{
+    let mut bytes = Vec::new();
+    let size = std::mem::size_of::<usize>();
+    let recovered_indexes: Vec<usize> = cryptic_data
+        .chunks(size)
+        .map(|chunk| usize::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    
+    for indexes in recovered_indexes{
+        bytes.push(hex_to_byte(&inverted_first_index[&indexes]).unwrap());
+
+    }
+    bytes
+}
