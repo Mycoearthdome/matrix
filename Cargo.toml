@@ -1,0 +1,12 @@
+[package]
+name = "matrix"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+indicatif = "0.17.9"
+regex = "1.11.1"
+
+[[bin]]
+name = "matrix"
+path = "src/matrix.rs"
