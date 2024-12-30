@@ -10,6 +10,7 @@ rand = "0.8.5"
 regex = "1.11.1"
 strum = "0.26.3"
 strum_macros = "0.26.4"
+tun-tap = "0.1.4"
 
 [[bin]]
 name = "matrix"
