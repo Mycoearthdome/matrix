@@ -118,8 +118,6 @@ struct IpHeader {
     checksum: u16,
     source: [u8; 4],
     destination: [u8; 4],
-    options: Vec<u8>,
-    padding: Vec<u8>,
 }
 
 #[repr(C)]
@@ -133,56 +131,9 @@ struct TcpHeader {
     window: u16,
     checksum: u16,
     urgent_pointer: u16,
-    options: Vec<u8>,
-    padding: Vec<u8>,
 }
 
-// Implement conversion methods for headers to bytes
-impl EthernetHeader {
-    fn to_bytes(&self) -> [u8; std::mem::size_of::<EthernetHeader>()] {
-        let mut bytes = [0u8; std::mem::size_of::<EthernetHeader>()];
-        bytes[..6].copy_from_slice(&self.destination);
-        bytes[6..12].copy_from_slice(&self.source);
-        bytes[12..14].copy_from_slice(&self.ethertype.to_be_bytes());
-        bytes
-    }
-}
 
-impl IpHeader {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.push(self.version_ihl);
-        bytes.push(self.tos);
-        bytes.extend_from_slice(&self.total_length.to_be_bytes());
-        bytes.extend_from_slice(&self.identification.to_be_bytes());
-        bytes.extend_from_slice(&self.flags_offset.to_be_bytes());
-        bytes.push(self.ttl);
-        bytes.push(self.protocol);
-        bytes.extend_from_slice(&self.checksum.to_be_bytes());
-        bytes.extend_from_slice(&self.source);
-        bytes.extend_from_slice(&self.destination);
-        bytes.extend_from_slice(&self.options);
-        bytes.extend_from_slice(&self.padding);
-        bytes
-    }
-}
-
-impl TcpHeader {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.source_port.to_be_bytes());
-        bytes.extend_from_slice(&self.destination_port.to_be_bytes());
-        bytes.extend_from_slice(&self.sequence_number.to_be_bytes());
-        bytes.extend_from_slice(&self.acknowledgment_number.to_be_bytes());
-        bytes.extend_from_slice(&self.data_offset_flags.to_be_bytes());
-        bytes.extend_from_slice(&self.window.to_be_bytes());
-        bytes.extend_from_slice(&self.checksum.to_be_bytes());
-        bytes.extend_from_slice(&self.urgent_pointer.to_be_bytes());
-        bytes.extend_from_slice(&self.options);
-        bytes.extend_from_slice(&self.padding);
-        bytes
-    }
-}
 
 fn ip_header_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
@@ -353,30 +304,32 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                     continue;
                 }
 
-                // Parse the headers
-                let eth_header: &EthernetHeader =
-                    unsafe { &*(buf.as_ptr() as *const EthernetHeader) };
-                let ip_header: &IpHeader = unsafe {
-                    &*(buf[std::mem::size_of::<EthernetHeader>()..].as_ptr() as *const IpHeader)
-                };
-                let tcp_header: &TcpHeader = unsafe {
-                    &*(buf[(std::mem::size_of::<EthernetHeader>()
-                        + std::mem::size_of::<IpHeader>())..]
-                        .as_ptr() as *const TcpHeader)
-                };
-
+                // Parse the packet.
+                let mut ethernet_packet = MutableEthernetPacket::new(&mut buf).unwrap();
+                let ip_packet = Ipv4Packet::new(&mut ethernet_packet.payload()).unwrap();
+                let tcp_packet = TcpPacket::new(&mut ip_packet.payload()).unwrap();
+                
                 // Extract the TCP payload
-                let tcp_header_length = ((tcp_header.data_offset_flags >> 12) & 0x0F) as usize * 4; // Data offset is in 32-bit words
-                let payload_start = std::mem::size_of::<EthernetHeader>()
-                    + std::mem::size_of::<IpHeader>()
-                    + tcp_header_length;
-                let old_payload = &buf[payload_start..nbytes];
+                let tcp_payload = tcp_packet.payload();
 
                 // Modify the payload.
-                let old_payload = old_payload.to_vec();
-                let (recoded_indexes, cryptic_data) = recode_indexes(old_payload.clone());
+                let tcp_payload = tcp_payload.to_vec();
+                let (recoded_indexes, cryptic_data) = recode_indexes(tcp_payload.clone());
                 let decrypted_payload = rebuild(cryptic_data, recoded_indexes);
                 let decrypted_payload_length = decrypted_payload.len();
+
+
+                // Accumulate fragmented packets until a packet smaller than MSS is received.
+                // TODO:
+                // 1. Accumulate fragmented packets: Store fragments in a buffer as they are received.
+                // 2. Check if the packet meets MSS: Continue accumulating fragments if packet size <= MSS.
+                // 3. Wait for a packet smaller than MSS: Reassemble packet when a smaller packet is received.
+                // 4. Reassemble the packet: Combine accumulated fragments into a single packet.
+                // 5. Account for window size: Check current window size before sending reassembled packet.
+                // 6. Fragment the reassembled packet (if necessary): Split packet into smaller fragments if it exceeds window size.
+                // 7. Send the fragments to the tunnel: Transmit fragmented packets to the tunnel for forwarding.
+
+
 
                 // Construct the new packet
                 let total_length = (std::mem::size_of::<IpHeader>()
@@ -395,8 +348,6 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                     checksum: 0,                        // Calculate checksum later
                     source: ip_header.source,           // Use the original source IP
                     destination: ip_header.destination, // Use the original destination IP
-                    options: Vec::new(),
-                    padding: Vec::new(),
                 };
 
                 let new_tcp_header = TcpHeader {
@@ -408,8 +359,6 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                     window: tcp_header.window,        // Use the original window size
                     checksum: 0,                      // Calculate checksum later
                     urgent_pointer: 0,
-                    options: Vec::new(),
-                    padding: Vec::new(),
                 };
 
                 // Create a buffer to hold the full packet
@@ -488,10 +437,6 @@ fn send_out_packets(
     let _ = stream.write_all(&new_packet);
 
 }
-
-
-
-
 
 
 fn handle_outgoing_connection(mut stream: TcpStream, mss: u16) {
