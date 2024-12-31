@@ -21,62 +21,6 @@ use tun_tap::{Iface, Mode as TunMode};
 
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
-/*
-ETHERNET
-0                   1                   2                   3                   4              
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                      Destination MAC Address                                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                         Source MAC Address                                    |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           EtherType           |                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                                                               +
-|                                                                                               |
-+                                            Payload                                            +
-|                                                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-
-IP
-0                   1                   2                   3  
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|Version|  IHL  |Type of Service|          Total Length         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         Identification        |Flags|     Fragment Offset     |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Time to Live |    Protocol   |        Header Checksum        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Source Address                        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                      Destination Address                      |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    Options                    |    Padding    |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-TCP
-0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          Source Port          |        Destination Port       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        Sequence Number                        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                     Acknowledgment Number                     |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Offset|  Res. |     Flags     |             Window            |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|            Checksum           |         Urgent Pointer        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    Options                    |    Padding    |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-* `MF` (More Fragments) is the 3rd bit of the `Reserved` field (bit 3)
-* `DF` (Don't Fragment) is the 2nd bit of the `Reserved` field (bit 2)
-* `Offset` (Fragment Offset) is a 13-bit field that starts at bit 4 of the `Data Offset` field
-
-*/
 
 const HEX_ARRAY: [&str; 256] = [
     "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0A", "0B", "0C", "0D", "0E", "0F",
@@ -245,10 +189,11 @@ fn start_tunnel(local_ip: &str, local_port: u16, remote_ip: &str, remote_port: u
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let mss = get_negotiated_mss(&stream).unwrap();
                     // Handle the connection in a new thread
                     let iface_clone = Arc::clone(&iface_clone);
                     let stream = Arc::new(Mutex::new(stream)); // Wrap the stream in Arc<Mutex>
-                    thread::spawn(move || handle_incoming_connection(stream, iface_clone));
+                    thread::spawn(move || handle_incoming_connection(stream, iface_clone, mss));
                 }
                 Err(e) => eprintln!("Failed to accept connection: {}", e),
             }
@@ -287,9 +232,10 @@ fn start_tunnel(local_ip: &str, local_port: u16, remote_ip: &str, remote_port: u
     }
 }
 
-fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<Iface>>) {
+fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<Iface>>, mss: u16) {
     //decrypts on the fly.
     let mut buf = [0u8; 2048]; // Buffer for reading packets
+    let mut decrypted_buf = Vec::new();
     loop {
         match stream.lock().unwrap().read(&mut buf) {
             Ok(0) => break, // Connection closed
@@ -316,61 +262,28 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                 let tcp_payload = tcp_payload.to_vec();
                 let (recoded_indexes, cryptic_data) = recode_indexes(tcp_payload.clone());
                 let decrypted_payload = rebuild(cryptic_data, recoded_indexes);
-                let decrypted_payload_length = decrypted_payload.len();
+                //let decrypted_payload_length = decrypted_payload.len();
 
+                
+                if nbytes == mss as usize{
+                    // accumulate the decrypted payloads
+                    decrypted_buf.extend(decrypted_payload);
 
-                // Accumulate fragmented packets until a packet smaller than MSS is received.
-                // TODO:
-                // 1. Accumulate fragmented packets: Store fragments in a buffer as they are received.
-                // 2. Check if the packet meets MSS: Continue accumulating fragments if packet size <= MSS.
-                // 3. Wait for a packet smaller than MSS: Reassemble packet when a smaller packet is received.
-                // 4. Reassemble the packet: Combine accumulated fragments into a single packet.
-                // 5. Account for window size: Check current window size before sending reassembled packet.
-                // 6. Fragment the reassembled packet (if necessary): Split packet into smaller fragments if it exceeds window size.
-                // 7. Send the fragments to the tunnel: Transmit fragmented packets to the tunnel for forwarding.
+                } else if nbytes < mss as usize && decrypted_buf.len() > 0{
+                    //rebuild the payload and send it through
+                    decrypted_buf.extend(decrypted_payload);
+                    let reassembled_payload = decrypted_buf.clone();
+                    send_out_packets_tun(iface.lock().unwrap(), &mut ethernet_packet, &reassembled_payload);
+                    decrypted_buf.clear();
 
+                } else if nbytes < mss as usize && decrypted_buf.len() == 0{
+                    // send it through
+                    send_out_packets_tun(iface.lock().unwrap(), &mut ethernet_packet, &decrypted_payload);
+                } else {
+                    // a packet got here that had a size bigger than mss.
+                    unimplemented!() //TODO: Better than that. PANICS
+                }
 
-
-                // Construct the new packet
-                let total_length = (std::mem::size_of::<IpHeader>()
-                    + std::mem::size_of::<TcpHeader>()
-                    + decrypted_payload_length) as u16;
-
-                // Create new headers
-                let new_ip_header = IpHeader {
-                    version_ihl: 0x45, // Version 4, IHL 5 (20 bytes)
-                    tos: 0,
-                    total_length,
-                    identification: 0,
-                    flags_offset: 0,
-                    ttl: 64,
-                    protocol: 6,                        // TCP
-                    checksum: 0,                        // Calculate checksum later
-                    source: ip_header.source,           // Use the original source IP
-                    destination: ip_header.destination, // Use the original destination IP
-                };
-
-                let new_tcp_header = TcpHeader {
-                    source_port: tcp_header.source_port, // Use the original source port
-                    destination_port: tcp_header.destination_port, // Use the original destination port
-                    sequence_number: tcp_header.sequence_number + decrypted_payload_length as u32, // Update sequence number
-                    acknowledgment_number: tcp_header.acknowledgment_number, // Use the original acknowledgment number
-                    data_offset_flags: (5 << 12) | 0, // Data offset (5 for 20 bytes) and flags
-                    window: tcp_header.window,        // Use the original window size
-                    checksum: 0,                      // Calculate checksum later
-                    urgent_pointer: 0,
-                };
-
-                // Create a buffer to hold the full packet
-                let mut new_packet = Vec::new();
-                new_packet.extend_from_slice(&eth_header.to_bytes());
-                new_packet.extend_from_slice(&new_ip_header.to_bytes());
-                new_packet.extend_from_slice(&new_tcp_header.to_bytes());
-                new_packet.extend_from_slice(&decrypted_payload); // Append the decrypted TCP payload
-
-                // Send the new packet to the TUN interface
-                let iface = iface.lock().unwrap();
-                iface.send(&new_packet).expect("Failed to write to TUN");
             }
             Err(e) => {
                 eprintln!("Failed to read from stream: {}", e);
@@ -380,7 +293,62 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
     }
 }
 
-fn send_out_packets(
+fn send_out_packets_tun(
+    iface: std::sync::MutexGuard<'_, Iface>,
+    ethernet_packet: &mut MutableEthernetPacket,
+    tcp_payload: &Vec<u8>,
+) {
+    // Get a mutable slice of the Ethernet packet's payload
+    let mut ethernet_payload = ethernet_packet.payload().to_vec();
+
+    // Create a mutable IP packet from the Ethernet payload
+    let mut ip_packet = MutableIpv4Packet::new(&mut ethernet_payload).unwrap();
+
+    // Get a mutable slice of the IP packet's payload
+    let mut ip_payload = ip_packet.payload().to_vec();
+
+    // Create a mutable TCP packet from the IP packet's payload
+    let mut tcp_packet = MutableTcpPacket::new(&mut ip_payload).unwrap();
+
+    // Set the new payload in the TCP packet
+    tcp_packet.set_payload(&tcp_payload);
+
+    // Calculate the total length for the IP header
+    let ip_header_length = ip_packet.get_header_length() as usize;
+
+    // Extract the Data Offset from the TCP header to calculate the TCP header length
+    let tcp_header_length = (tcp_packet.packet()[12] >> 4) as usize * 4; // TCP header length in bytes
+
+    let total_length = ip_header_length + tcp_header_length + tcp_payload.len();
+
+    // Set the Total Length field in the IP header
+    ip_packet.set_total_length(total_length as u16);
+
+    // Reset and recalculate the IP checksum
+    ip_packet.set_checksum(0); // reset
+    ip_packet.set_checksum(ip_header_checksum(&ip_packet.packet()[..ip_header_length]));
+
+    // Reset and recalculate the TCP checksum
+    tcp_packet.set_checksum(0); // reset
+    tcp_packet.set_checksum(tcp_header_checksum(&tcp_packet, ip_packet.get_source(), ip_packet.get_destination())); // Pass a reference
+
+    // Construct the new packet to send
+    let new_packet = {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(ethernet_packet.packet()); // Ethernet header
+        packet.extend_from_slice(ip_packet.packet()); // IP header
+        packet.extend_from_slice(tcp_packet.packet()); // TCP header & tcp Payload
+        //packet.extend_from_slice(&new_payload); // Payload
+        packet
+    };
+
+    // Send the new packet to the TUN interface
+    //let iface = iface.lock().unwrap();
+    iface.send(&new_packet).expect("Failed to write to TUN");
+
+}
+
+fn send_out_packets_wire(
     stream: &mut TcpStream,
     ethernet_packet: &mut MutableEthernetPacket,
     process_data: &Vec<u8>,
@@ -428,8 +396,8 @@ fn send_out_packets(
         let mut packet = Vec::new();
         packet.extend_from_slice(ethernet_packet.packet()); // Ethernet header
         packet.extend_from_slice(ip_packet.packet()); // IP header
-        packet.extend_from_slice(tcp_packet.packet()); // TCP header
-        packet.extend_from_slice(&new_payload); // Payload
+        packet.extend_from_slice(tcp_packet.packet()); // TCP header & payload
+        //packet.extend_from_slice(&new_payload); // Payload
         packet
     };
 
@@ -478,9 +446,9 @@ fn handle_outgoing_connection(mut stream: TcpStream, mss: u16) {
                     if new_packet_size > mss{
                         process_data.clear();
                         process_data = old_payload.drain(0..offsets[fragment] as usize).collect();
-                        send_out_packets(&mut stream, &mut ethernet_packet, &process_data);
+                        send_out_packets_wire(&mut stream, &mut ethernet_packet, &process_data);
                     } else {
-                        send_out_packets(&mut stream, &mut ethernet_packet, &process_data);
+                        send_out_packets_wire(&mut stream, &mut ethernet_packet, &process_data);
                     }
                 }
             }
@@ -527,16 +495,6 @@ fn modify_packet_payload(payload: &Vec<u8>, first_index: HashMap<String, i16>) -
     return bytes;
 }
 
-fn decrypt_packet_payload(payload: Vec<u8>, first_index: HashMap<String, i16>) -> Vec<u8> {
-    let mut indexes = Vec::new();
-
-    for byte in payload {
-        indexes.push(first_index[&byte_to_hex(&byte)]);
-    }
-
-    let bytes: Vec<u8> = indexes.iter().flat_map(|x| x.to_le_bytes()).collect();
-    return bytes;
-}
 
 fn seek_avail(filename: &str, first_index: HashMap<String, i16>) -> Vec<u8> {
     let mut indexes = Vec::new();
