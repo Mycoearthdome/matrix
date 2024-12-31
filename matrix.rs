@@ -1,20 +1,82 @@
+use clap::{Arg, Command, ValueEnum};
 use indicatif::ProgressBar;
+use libc;
+use rand::prelude::SliceRandom;
+use rand::thread_rng;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
-use clap::{Arg, Command, ValueEnum};
-use strum_macros::EnumString;
-use rand::thread_rng;
-use rand::prelude::SliceRandom;
-
 use std::sync::{Arc, Mutex};
 use std::thread;
+use strum_macros::EnumString;
 
-use std::net::{TcpListener, TcpStream};
+use pnet::packet::Packet;
+use pnet::packet::ethernet::MutableEthernetPacket;
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::tcp::{TcpPacket, MutableTcpPacket};
+
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use tun_tap::{Iface, Mode as TunMode};
 
+use std::os::unix::io::AsRawFd;
 use std::time::Duration;
+/*
+ETHERNET
+0                   1                   2                   3                   4              
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                      Destination MAC Address                                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                         Source MAC Address                                    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|           EtherType           |                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                                                               +
+|                                                                                               |
++                                            Payload                                            +
+|                                                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+
+IP
+0                   1                   2                   3  
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|Version|  IHL  |Type of Service|          Total Length         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Identification        |Flags|     Fragment Offset     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Time to Live |    Protocol   |        Header Checksum        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Source Address                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                      Destination Address                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Options                    |    Padding    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+TCP
+0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Source Port          |        Destination Port       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Sequence Number                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Acknowledgment Number                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Offset|  Res. |     Flags     |             Window            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|            Checksum           |         Urgent Pointer        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Options                    |    Padding    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+* `MF` (More Fragments) is the 3rd bit of the `Reserved` field (bit 3)
+* `DF` (Don't Fragment) is the 2nd bit of the `Reserved` field (bit 2)
+* `Offset` (Fragment Offset) is a 13-bit field that starts at bit 4 of the `Data Offset` field
+
+*/
 
 const HEX_ARRAY: [&str; 256] = [
     "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0A", "0B", "0C", "0D", "0E", "0F",
@@ -35,7 +97,6 @@ const HEX_ARRAY: [&str; 256] = [
     "F0", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "FA", "FB", "FC", "FD", "FE", "FF",
 ];
 
-
 #[repr(C)]
 #[derive(Debug)]
 struct EthernetHeader {
@@ -43,7 +104,6 @@ struct EthernetHeader {
     source: [u8; 6],
     ethertype: u16,
 }
-
 
 #[repr(C)]
 #[derive(Debug)]
@@ -58,8 +118,9 @@ struct IpHeader {
     checksum: u16,
     source: [u8; 4],
     destination: [u8; 4],
+    options: Vec<u8>,
+    padding: Vec<u8>,
 }
-
 
 #[repr(C)]
 #[derive(Debug)]
@@ -72,6 +133,8 @@ struct TcpHeader {
     window: u16,
     checksum: u16,
     urgent_pointer: u16,
+    options: Vec<u8>,
+    padding: Vec<u8>,
 }
 
 // Implement conversion methods for headers to bytes
@@ -86,94 +149,144 @@ impl EthernetHeader {
 }
 
 impl IpHeader {
-    fn to_bytes(&self) -> [u8; std::mem::size_of::<IpHeader>()] {
-        let mut bytes = [0u8; std::mem::size_of::<IpHeader>()];
-        bytes[0] = self.version_ihl;
-        bytes[1] = self.tos;
-        bytes[2..4].copy_from_slice(&self.total_length.to_be_bytes());
-        bytes[4..6].copy_from_slice(&self.identification.to_be_bytes());
-        bytes[6..8].copy_from_slice(&self.flags_offset.to_be_bytes());
-        bytes[8] = self.ttl;
-        bytes[9] = self.protocol;
-        bytes[10..12].copy_from_slice(&self.checksum.to_be_bytes());
-        bytes[12..16].copy_from_slice(&self.source);
-        bytes[16..20].copy_from_slice(&self.destination);
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(self.version_ihl);
+        bytes.push(self.tos);
+        bytes.extend_from_slice(&self.total_length.to_be_bytes());
+        bytes.extend_from_slice(&self.identification.to_be_bytes());
+        bytes.extend_from_slice(&self.flags_offset.to_be_bytes());
+        bytes.push(self.ttl);
+        bytes.push(self.protocol);
+        bytes.extend_from_slice(&self.checksum.to_be_bytes());
+        bytes.extend_from_slice(&self.source);
+        bytes.extend_from_slice(&self.destination);
+        bytes.extend_from_slice(&self.options);
+        bytes.extend_from_slice(&self.padding);
         bytes
     }
 }
 
 impl TcpHeader {
-    fn to_bytes(&self) -> [u8; std::mem::size_of::<TcpHeader>()] {
-        let mut bytes = [0u8; std::mem::size_of::<TcpHeader>()];
-        bytes[0..2].copy_from_slice(&self.source_port.to_be_bytes());
-        bytes[2..4].copy_from_slice(&self.destination_port.to_be_bytes());
-        bytes[4..8].copy_from_slice(&self.sequence_number.to_be_bytes());
-        bytes[8..12].copy_from_slice(&self.acknowledgment_number.to_be_bytes());
-        bytes[12..14].copy_from_slice(&self.data_offset_flags.to_be_bytes());
-        bytes[14..16].copy_from_slice(&self.window.to_be_bytes());
-        bytes[16..18].copy_from_slice(&self.checksum.to_be_bytes());
-        bytes[18..20].copy_from_slice(&self.urgent_pointer.to_be_bytes());
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.source_port.to_be_bytes());
+        bytes.extend_from_slice(&self.destination_port.to_be_bytes());
+        bytes.extend_from_slice(&self.sequence_number.to_be_bytes());
+        bytes.extend_from_slice(&self.acknowledgment_number.to_be_bytes());
+        bytes.extend_from_slice(&self.data_offset_flags.to_be_bytes());
+        bytes.extend_from_slice(&self.window.to_be_bytes());
+        bytes.extend_from_slice(&self.checksum.to_be_bytes());
+        bytes.extend_from_slice(&self.urgent_pointer.to_be_bytes());
+        bytes.extend_from_slice(&self.options);
+        bytes.extend_from_slice(&self.padding);
         bytes
     }
 }
 
+fn ip_header_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for chunk in header.chunks(2) {
+        let word: u16 = match chunk.len() {
+            1 => (chunk[0] as u16) << 8,
+            2 => ((chunk[0] as u16) << 8) | (chunk[1] as u16),
+            _ => unreachable!(),
+        };
+        sum += word as u32;
+        if sum > 0xFFFF {
+            sum = (sum >> 16) + (sum & 0xFFFF);
+        }
+    }
+    !sum as u16
+}
 
-fn extract_tcp_payload(packet: &[u8]) -> Option<(&[u8], usize)> {
-    // Check if the packet is long enough to contain an Ethernet header
-    if packet.len() < std::mem::size_of::<EthernetHeader>() {
-        return None;
+fn tcp_header_checksum(packet: &MutableTcpPacket, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> u16 {
+    let mut sum = 0u32;
+    let src_ip: &[u8; 4] = &src_ip.octets();
+    let dst_ip: &[u8; 4] = &dst_ip.octets();
+
+    // Pseudo-header
+    sum += (src_ip[0] as u32) << 24;
+    sum += (src_ip[1] as u32) << 16;
+    sum += (src_ip[2] as u32) << 8;
+    sum += src_ip[3] as u32;
+    sum += (dst_ip[0] as u32) << 24;
+    sum += (dst_ip[1] as u32) << 16;
+    sum += (dst_ip[2] as u32) << 8;
+    sum += dst_ip[3] as u32;
+    sum += 0x0006; // Protocol number for TCP
+    sum += packet.packet().len() as u32; // TCP length
+
+    // Add the TCP header and data
+    for chunk in packet.packet().chunks(2) {
+        match chunk.len() {
+            2 => {
+                sum += ((chunk[0] as u32) << 8) | (chunk[1] as u32);
+            }
+            1 => {
+                sum += (chunk[0] as u32) << 8;
+            }
+            _ => unreachable!(),
+        }
     }
 
-    // Parse Ethernet header
-    let eth_header: &EthernetHeader = unsafe { &*(packet.as_ptr() as *const EthernetHeader) };
-
-    // Check if the ethertype indicates an IPv4 packet (0x0800)
-    if eth_header.ethertype != 0x0800 {
-        return None;
+    // Fold the sum into a 16-bit value
+    while sum > 0xFFFF {
+        sum = (sum >> 16) + (sum & 0xFFFF);
     }
 
-    // Check if the packet is long enough to contain an IP header
-    let ip_header_offset = std::mem::size_of::<EthernetHeader>();
-    if packet.len() < ip_header_offset + std::mem::size_of::<IpHeader>() {
-        return None;
-    }
+    // Return the one's complement of the sum
+    !sum as u16
+}
 
-    // Parse IP header
-    let ip_header: &IpHeader = unsafe { &*(packet[ip_header_offset..].as_ptr() as *const IpHeader) };
+fn get_negotiated_mss(stream: &TcpStream) -> std::io::Result<u16> {
+    let fd = stream.as_raw_fd();
+    let mut mss: libc::c_int = 0;
+    let mut optlen = std::mem::size_of_val(&mss) as libc::socklen_t;
 
-    // Check if the protocol is TCP (6)
-    if ip_header.protocol != 6 {
-        return None;
-    }
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mut mss as *mut _ as *mut libc::c_void,
+            &mut optlen,
+        )
+    };
 
-    // Check if the packet is long enough to contain a TCP header
-    let ip_header_length = (ip_header.version_ihl & 0x0F) as usize * 4; // IHL is in 32-bit words
-    let tcp_header_offset = ip_header_offset + ip_header_length;
-    if packet.len() < tcp_header_offset + std::mem::size_of::<TcpHeader>() {
-        return None;
-    }
-
-    // Parse TCP header
-    let tcp_header: &TcpHeader = unsafe { &*(packet[tcp_header_offset..].as_ptr() as *const TcpHeader) };
-
-    // Calculate the TCP header length
-    let tcp_header_length = ((tcp_header.data_offset_flags >> 12) & 0x0F) as usize * 4; // Data offset is in 32-bit words
-
-    // The payload starts after the TCP header
-    let payload_start = tcp_header_offset + tcp_header_length;
-    if payload_start < packet.len() {
-        Some((&packet[payload_start..], payload_start)) // Return the TCP payload and payload offset
+    if ret == 0 {
+        Ok(mss as u16)
     } else {
-        None
+        Err(std::io::Error::last_os_error())
     }
+}
+
+fn calculate_fragment_offset(packet_length: u16, mss: u16) -> Vec<u16> {
+    let mut offset = 0;
+    let mut remaining_bytes = packet_length;
+    let mut offsets = Vec::new();
+
+    if remaining_bytes < mss -512{
+        offset =remaining_bytes;
+        offsets.push(offset);
+    }
+
+    while remaining_bytes > mss - 512 {
+        offset += mss - 512;
+        remaining_bytes -= mss -512;
+        offsets.push(offset);
+    }
+
+    offsets
 }
 
 fn start_tunnel(local_ip: &str, local_port: u16, remote_ip: &str, remote_port: u16) {
     // Create a new TUN device
-    let iface = Arc::new(Mutex::new(Iface::new("tun0", TunMode::Tun).unwrap()));
+    let iface = Arc::new(Mutex::new(Iface::new("tun1", TunMode::Tun).unwrap()));
 
     // Create a TCP listener for incoming connections
-    let listener = TcpListener::bind(format!("{}:{}", local_ip, local_port)).expect("Could not bind TCP listener");
+    let listener = TcpListener::bind(format!("{}:{}", local_ip, local_port))
+        .expect("Could not bind TCP listener");
 
     // Accept incoming connections in a separate thread
     let iface_clone = Arc::clone(&iface);
@@ -198,21 +311,24 @@ fn start_tunnel(local_ip: &str, local_port: u16, remote_ip: &str, remote_port: u
     println!("Connecting!");
 
     // Connect to the remote peer
-    let stream = Arc::new(Mutex::new(TcpStream::connect(format!("{}:{}", remote_ip, remote_port)).expect("Could not connect to remote peer")));
-
+    let stream = 
+        TcpStream::connect(format!("{}:{}", remote_ip, remote_port))
+            .expect("Could not connect to remote peer");
+    println!("Connected to {}:{}", remote_ip, remote_port);
+    let mss = get_negotiated_mss(&stream).unwrap();
     // Thread to read from TUN and send to remote peer(tx)
-    let iface_clone = Arc::clone(&iface);
-    let stream_clone = Arc::clone(&stream); // Clone the Arc for the thread
-    //thread::spawn(move || {
-    //    let mut buf = [0u8; 2048]; // Buffer for reading packets
-    //    loop {
-    //        let len = iface_clone.lock().unwrap().recv(&mut buf).expect("Failed to read from TUN");
+    //let iface_clone = Arc::clone(&iface);
+    //let stream_clone = Arc::clone(&stream); // Clone the Arc for the thread
+                                            //thread::spawn(move || {
+                                            //    let mut buf = [0u8; 2048]; // Buffer for reading packets
+                                            //    loop {
+                                            //        let len = iface_clone.lock().unwrap().recv(&mut buf).expect("Failed to read from TUN");
 
     //        let mut stream = stream_clone.lock().unwrap(); // Lock the stream for writing
     //        stream.write_all(&buf[..len]).expect("Failed to send packet to remote peer");
     //    }
     //});
-    handle_outgoing_connection(stream_clone, iface_clone);
+    handle_outgoing_connection(stream, mss);
 
     // Keep the main thread alive
     loop {
@@ -220,27 +336,40 @@ fn start_tunnel(local_ip: &str, local_port: u16, remote_ip: &str, remote_port: u
     }
 }
 
-fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<Iface>>) { //decrypts on the fly.
+fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<Iface>>) {
+    //decrypts on the fly.
     let mut buf = [0u8; 2048]; // Buffer for reading packets
     loop {
         match stream.lock().unwrap().read(&mut buf) {
             Ok(0) => break, // Connection closed
             Ok(nbytes) => {
                 // Ensure the packet is long enough to contain the headers
-                if nbytes < std::mem::size_of::<EthernetHeader>() + std::mem::size_of::<IpHeader>() + std::mem::size_of::<TcpHeader>() {
+                if nbytes
+                    < std::mem::size_of::<EthernetHeader>()
+                        + std::mem::size_of::<IpHeader>()
+                        + std::mem::size_of::<TcpHeader>()
+                {
                     eprintln!("Received packet is too small.");
                     continue;
                 }
 
                 // Parse the headers
-                let eth_header: &EthernetHeader = unsafe { &*(buf.as_ptr() as *const EthernetHeader) };
-                let ip_header: &IpHeader = unsafe { &*(buf[std::mem::size_of::<EthernetHeader>()..].as_ptr() as *const IpHeader) };
-                let tcp_header: &TcpHeader = unsafe { &*(buf[(std::mem::size_of::<EthernetHeader>() + std::mem::size_of::<IpHeader>())..].as_ptr() as *const TcpHeader) };
+                let eth_header: &EthernetHeader =
+                    unsafe { &*(buf.as_ptr() as *const EthernetHeader) };
+                let ip_header: &IpHeader = unsafe {
+                    &*(buf[std::mem::size_of::<EthernetHeader>()..].as_ptr() as *const IpHeader)
+                };
+                let tcp_header: &TcpHeader = unsafe {
+                    &*(buf[(std::mem::size_of::<EthernetHeader>()
+                        + std::mem::size_of::<IpHeader>())..]
+                        .as_ptr() as *const TcpHeader)
+                };
 
                 // Extract the TCP payload
-                let ip_header_length = (ip_header.version_ihl & 0x0F) as usize * 4; // IHL is in 32-bit words
                 let tcp_header_length = ((tcp_header.data_offset_flags >> 12) & 0x0F) as usize * 4; // Data offset is in 32-bit words
-                let payload_start = std::mem::size_of::<EthernetHeader>() + std::mem::size_of::<IpHeader>() + tcp_header_length;
+                let payload_start = std::mem::size_of::<EthernetHeader>()
+                    + std::mem::size_of::<IpHeader>()
+                    + tcp_header_length;
                 let old_payload = &buf[payload_start..nbytes];
 
                 // Modify the payload.
@@ -250,7 +379,9 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                 let decrypted_payload_length = decrypted_payload.len();
 
                 // Construct the new packet
-                let total_length = (std::mem::size_of::<IpHeader>() + std::mem::size_of::<TcpHeader>() + decrypted_payload_length) as u16;
+                let total_length = (std::mem::size_of::<IpHeader>()
+                    + std::mem::size_of::<TcpHeader>()
+                    + decrypted_payload_length) as u16;
 
                 // Create new headers
                 let new_ip_header = IpHeader {
@@ -260,10 +391,12 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                     identification: 0,
                     flags_offset: 0,
                     ttl: 64,
-                    protocol: 6, // TCP
-                    checksum: 0, // Calculate checksum later
-                    source: ip_header.source, // Use the original source IP
+                    protocol: 6,                        // TCP
+                    checksum: 0,                        // Calculate checksum later
+                    source: ip_header.source,           // Use the original source IP
                     destination: ip_header.destination, // Use the original destination IP
+                    options: Vec::new(),
+                    padding: Vec::new(),
                 };
 
                 let new_tcp_header = TcpHeader {
@@ -272,9 +405,11 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
                     sequence_number: tcp_header.sequence_number + decrypted_payload_length as u32, // Update sequence number
                     acknowledgment_number: tcp_header.acknowledgment_number, // Use the original acknowledgment number
                     data_offset_flags: (5 << 12) | 0, // Data offset (5 for 20 bytes) and flags
-                    window: tcp_header.window, // Use the original window size
-                    checksum: 0, // Calculate checksum later
+                    window: tcp_header.window,        // Use the original window size
+                    checksum: 0,                      // Calculate checksum later
                     urgent_pointer: 0,
+                    options: Vec::new(),
+                    padding: Vec::new(),
                 };
 
                 // Create a buffer to hold the full packet
@@ -296,77 +431,113 @@ fn handle_incoming_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
     }
 }
 
+fn send_out_packets(
+    stream: &mut TcpStream,
+    ethernet_packet: &mut MutableEthernetPacket,
+    process_data: &Vec<u8>,
+) {
+    // Get a mutable slice of the Ethernet packet's payload
+    let mut ethernet_payload = ethernet_packet.payload().to_vec();
 
-fn handle_outgoing_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<Iface>>) { //encrypts on the fly.
+    // Create a mutable IP packet from the Ethernet payload
+    let mut ip_packet = MutableIpv4Packet::new(&mut ethernet_payload).unwrap();
+
+    // Get a mutable slice of the IP packet's payload
+    let mut ip_payload = ip_packet.payload().to_vec();
+
+    // Create a mutable TCP packet from the IP packet's payload
+    let mut tcp_packet = MutableTcpPacket::new(&mut ip_payload).unwrap();
+
+    let (random_indexes, indexes_bytes) = random_indexes();
+    let mut new_payload = modify_packet_payload(process_data, random_indexes);
+    new_payload.extend(indexes_bytes); // indexed at the end of the payload
+
+    // Set the new payload in the TCP packet
+    tcp_packet.set_payload(&new_payload);
+
+    // Calculate the total length for the IP header
+    let ip_header_length = ip_packet.get_header_length() as usize;
+
+    // Extract the Data Offset from the TCP header to calculate the TCP header length
+    let tcp_header_length = (tcp_packet.packet()[12] >> 4) as usize * 4; // TCP header length in bytes
+
+    let total_length = ip_header_length + tcp_header_length + new_payload.len();
+
+    // Set the Total Length field in the IP header
+    ip_packet.set_total_length(total_length as u16);
+
+    // Reset and recalculate the IP checksum
+    ip_packet.set_checksum(0); // reset
+    ip_packet.set_checksum(ip_header_checksum(&ip_packet.packet()[..ip_header_length]));
+
+    // Reset and recalculate the TCP checksum
+    tcp_packet.set_checksum(0); // reset
+    tcp_packet.set_checksum(tcp_header_checksum(&tcp_packet, ip_packet.get_source(), ip_packet.get_destination())); // Pass a reference
+
+    // Construct the new packet to send
+    let new_packet = {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(ethernet_packet.packet()); // Ethernet header
+        packet.extend_from_slice(ip_packet.packet()); // IP header
+        packet.extend_from_slice(tcp_packet.packet()); // TCP header
+        packet.extend_from_slice(&new_payload); // Payload
+        packet
+    };
+
+    // Send the new packet to the remote peer.
+    let _ = stream.write_all(&new_packet);
+
+}
+
+
+
+
+
+
+fn handle_outgoing_connection(mut stream: TcpStream, mss: u16) {
+    //encrypts on the fly.
     let mut buf = [0u8; 2048]; // Buffer for reading packets
     loop {
-        match stream.lock().unwrap().read(&mut buf) {
+        match stream.read(&mut buf) {
             Ok(0) => break, // Connection closed
             Ok(nbytes) => {
                 // Ensure the packet is long enough to contain the headers
-                if nbytes < std::mem::size_of::<EthernetHeader>() + std::mem::size_of::<IpHeader>() + std::mem::size_of::<TcpHeader>() {
+                if nbytes
+                    < std::mem::size_of::<EthernetHeader>()
+                        + std::mem::size_of::<IpHeader>()
+                        + std::mem::size_of::<TcpHeader>()
+                {
                     eprintln!("Received packet is too small.");
                     continue;
                 }
 
-                // Parse the headers
-                let eth_header: &EthernetHeader = unsafe { &*(buf.as_ptr() as *const EthernetHeader) };
-                let ip_header: &IpHeader = unsafe { &*(buf[std::mem::size_of::<EthernetHeader>()..].as_ptr() as *const IpHeader) };
-                let tcp_header: &TcpHeader = unsafe { &*(buf[(std::mem::size_of::<EthernetHeader>() + std::mem::size_of::<IpHeader>())..].as_ptr() as *const TcpHeader) };
-
+                // Parse the packet.
+                let mut ethernet_packet = MutableEthernetPacket::new(&mut buf).unwrap();
+                let ip_packet = Ipv4Packet::new(&mut ethernet_packet.payload()).unwrap();
+                let tcp_packet = TcpPacket::new(&mut ip_packet.payload()).unwrap();
+                
                 // Extract the TCP payload
-                let ip_header_length = (ip_header.version_ihl & 0x0F) as usize * 4; // IHL is in 32-bit words
-                let tcp_header_length = ((tcp_header.data_offset_flags >> 12) & 0x0F) as usize * 4; // Data offset is in 32-bit words
-                let payload_start = std::mem::size_of::<EthernetHeader>() + std::mem::size_of::<IpHeader>() + tcp_header_length;
-                let old_payload = &buf[payload_start..nbytes];
+                let old_payload = tcp_packet.payload();
 
+                // Evaluate the fragmentation of the payload
+                let new_packet_size = nbytes as u16 + old_payload.len() as u16 + 512 as u16;
+                let mut offsets = Vec::new();
+                if new_packet_size > mss {
+                    offsets = calculate_fragment_offset(new_packet_size, mss);
+                }
                 // Modify the payload.
-                let old_payload = old_payload.to_vec();
-                let (random_indexes, indexes_bytes) = random_indexes();
-                let mut new_payload = modify_packet_payload(&old_payload, random_indexes);
-                new_payload.extend(indexes_bytes); //indexed at the end of the payload.
-                let new_payload_length = new_payload.len();
-
-                // Construct the new packet
-                let total_length = (std::mem::size_of::<IpHeader>() + std::mem::size_of::<TcpHeader>() + new_payload_length) as u16;
-
-                // Create new headers
-                let new_ip_header = IpHeader {
-                    version_ihl: 0x45, // Version 4, IHL 5 (20 bytes)
-                    tos: 0,
-                    total_length,
-                    identification: 0,
-                    flags_offset: 0,
-                    ttl: 64,
-                    protocol: 6, // TCP
-                    checksum: 0, // Calculate checksum later
-                    source: ip_header.source, // Use the original source IP
-                    destination: ip_header.destination, // Use the original destination IP
-                };
-
-                let new_tcp_header = TcpHeader {
-                    source_port: tcp_header.source_port, // Use the original source port
-                    destination_port: tcp_header.destination_port, // Use the original destination port
-                    sequence_number: tcp_header.sequence_number + new_payload.len() as u32, // Update sequence number
-                    acknowledgment_number: tcp_header.acknowledgment_number, // Use the original acknowledgment number
-                    data_offset_flags: (5 << 12) | 0, // Data offset (5 for 20 bytes) and flags
-                    window: tcp_header.window, // Use the original window size
-                    checksum: 0, // Calculate checksum later
-                    urgent_pointer: 0,
-                };
-
-                // Create a buffer to hold the full packet
-                let mut new_packet = Vec::new();
-                new_packet.extend_from_slice(&eth_header.to_bytes());
-                new_packet.extend_from_slice(&new_ip_header.to_bytes());
-                new_packet.extend_from_slice(&new_tcp_header.to_bytes());
-                new_packet.extend_from_slice(&new_payload); // Append the new TCP payload
-
-
-                //TODO: ADJUST CHECKSUMS.(IP-TCP)
-
-                // Send the new packet to the remote peer.
-                stream.lock().unwrap().write_all(&new_packet).expect("Failed to send mofified packet to remote peer");
+                let mut old_payload = old_payload.to_vec();
+                let mut process_data = old_payload.clone();
+                for fragment in 0..offsets.len() {
+                    let new_packet_size = nbytes as u16 + old_payload.len() as u16 + 512 as u16;
+                    if new_packet_size > mss{
+                        process_data.clear();
+                        process_data = old_payload.drain(0..offsets[fragment] as usize).collect();
+                        send_out_packets(&mut stream, &mut ethernet_packet, &process_data);
+                    } else {
+                        send_out_packets(&mut stream, &mut ethernet_packet, &process_data);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Failed to read from stream: {}", e);
@@ -375,20 +546,18 @@ fn handle_outgoing_connection(stream: Arc<Mutex<TcpStream>>, iface: Arc<Mutex<If
         }
     }
 }
-               
 
-fn random_indexes() -> (HashMap<String, i16>, Vec<u8>){
+fn random_indexes() -> (HashMap<String, i16>, Vec<u8>) {
     let mut random_indexes = HashMap::new();
     let mut indexes = Vec::new();
     let mut rng = thread_rng();
     let mut all_i16: Vec<i16> = (256..=32767).collect();
     all_i16.shuffle(&mut rng);
     let mut count = 0;
-    for key in HEX_ARRAY{
+    for key in HEX_ARRAY {
         indexes.push(all_i16[count]);
         random_indexes.insert(key.to_string(), all_i16[count]);
         count += 1;
-
     }
     let bytes: Vec<u8> = indexes.iter().flat_map(|x| x.to_le_bytes()).collect();
     (random_indexes, bytes)
@@ -402,8 +571,7 @@ fn hex_to_byte(hex: &str) -> Option<u8> {
     u8::from_str_radix(hex, 16).ok()
 }
 
-
-fn modify_packet_payload(payload: &Vec<u8>,first_index: HashMap<String, i16>) -> Vec<u8> {
+fn modify_packet_payload(payload: &Vec<u8>, first_index: HashMap<String, i16>) -> Vec<u8> {
     let mut indexes = Vec::new();
 
     for byte in payload {
@@ -414,7 +582,7 @@ fn modify_packet_payload(payload: &Vec<u8>,first_index: HashMap<String, i16>) ->
     return bytes;
 }
 
-fn decrypt_packet_payload(payload: Vec<u8>,first_index: HashMap<String, i16>) -> Vec<u8> {
+fn decrypt_packet_payload(payload: Vec<u8>, first_index: HashMap<String, i16>) -> Vec<u8> {
     let mut indexes = Vec::new();
 
     for byte in payload {
@@ -424,7 +592,6 @@ fn decrypt_packet_payload(payload: Vec<u8>,first_index: HashMap<String, i16>) ->
     let bytes: Vec<u8> = indexes.iter().flat_map(|x| x.to_le_bytes()).collect();
     return bytes;
 }
-
 
 fn seek_avail(filename: &str, first_index: HashMap<String, i16>) -> Vec<u8> {
     let mut indexes = Vec::new();
@@ -445,7 +612,6 @@ fn seek_avail(filename: &str, first_index: HashMap<String, i16>) -> Vec<u8> {
     bar.finish();
     return bytes;
 }
-
 
 fn rebuild(cryptic_data: Vec<u8>, inverted_first_index: HashMap<i16, String>) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -531,20 +697,21 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             });
             let default_output_file = format!("{}.enc", input_file);
-            let output_file = matches.get_one::<String>("output_file").unwrap_or(&default_output_file);
+            let output_file = matches
+                .get_one::<String>("output_file")
+                .unwrap_or(&default_output_file);
             println!("Encrypting {} to {}", input_file, output_file);
 
             let (random_indexes, indexes_bytes) = random_indexes();
             let mut cryptic_data = seek_avail(input_file, random_indexes.clone());
 
-            for seek in (0..indexes_bytes.len()).step_by(2){
+            for seek in (0..indexes_bytes.len()).step_by(2) {
                 let index = i16::from_le_bytes([cryptic_data[seek], cryptic_data[seek + 1]]);
                 println!("indexes_bytes={}", index);
                 let _ = io::stdout().flush();
             }
 
             cryptic_data.extend(indexes_bytes); //our new index.
-            
 
             let mut outfile = File::create(output_file)?;
             outfile.write_all(&cryptic_data)?;
@@ -555,7 +722,9 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             });
             let default_output_file = format!("{}.dec", input_file);
-            let output_file = matches.get_one::<String>("output_file").unwrap_or(&default_output_file);
+            let output_file = matches
+                .get_one::<String>("output_file")
+                .unwrap_or(&default_output_file);
 
             println!("Decrypting {} to {}", input_file, output_file);
 
@@ -563,10 +732,8 @@ fn main() -> io::Result<()> {
             let mut cryptic_data_file = File::open(input_file)?;
             cryptic_data_file.read_to_end(&mut cryptic_data)?;
 
-
-            //let inverted_first_index = invert_hashmap(hardcoded_index); 
+            //let inverted_first_index = invert_hashmap(hardcoded_index);
             let (recoded_indexes, cryptic_data) = recode_indexes(cryptic_data);
-
 
             let rebuilt_bytes = rebuild(cryptic_data, recoded_indexes);
             let mut outfile = File::create(output_file)?;
@@ -577,7 +744,10 @@ fn main() -> io::Result<()> {
             let local_port = matches.get_one::<u16>("local_port").unwrap();
             let remote_ip = matches.get_one::<String>("remote_ip").unwrap();
             let remote_port = matches.get_one::<u16>("remote_port").unwrap();
-            println!("Setting up tunnel from {}:{} to {}:{}", local_ip, local_port, remote_ip, remote_port);
+            println!(
+                "Setting up tunnel from {}:{} to {}:{}",
+                local_ip, local_port, remote_ip, remote_port
+            );
             start_tunnel(&*local_ip, *local_port, &*remote_ip, *remote_port);
         }
     }
@@ -585,12 +755,11 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-
-fn recode_indexes(cryptic_data: Vec<u8>) -> (HashMap<i16, String>, Vec<u8>){
+fn recode_indexes(cryptic_data: Vec<u8>) -> (HashMap<i16, String>, Vec<u8>) {
     let mut indexes = Vec::new();
     let mut recoded_indexes = HashMap::new();
-    let start_index = cryptic_data.len()-512;
-    for seek in (start_index..cryptic_data.len()).step_by(2){
+    let start_index = cryptic_data.len() - 512;
+    for seek in (start_index..cryptic_data.len()).step_by(2) {
         let index = i16::from_le_bytes([cryptic_data[seek], cryptic_data[seek + 1]]);
         indexes.push(index);
         println!("recoded_indexes={}", index);
@@ -601,12 +770,14 @@ fn recode_indexes(cryptic_data: Vec<u8>) -> (HashMap<i16, String>, Vec<u8>){
     //let _ = io::stdout().flush();
 
     let mut count = 0;
-    for key in HEX_ARRAY{ //TODO: CHANGE THAT NOW!.
+    for key in HEX_ARRAY {
+        //TODO: CHANGE THAT NOW!.
         recoded_indexes.insert(indexes[count], key.to_string());
         count += 1;
     }
-    
 
-
-    (recoded_indexes, cryptic_data[..cryptic_data.len()-512].to_vec())
+    (
+        recoded_indexes,
+        cryptic_data[..cryptic_data.len() - 512].to_vec(),
+    )
 }
